@@ -1,10 +1,13 @@
-import com.bmuschko.gradle.docker.tasks.container.DockerCopyFileFromContainer
-
 import de.undercouch.gradle.tasks.download.Download
 
 import groovy.json.JsonSlurper
 
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
 import java.time.format.DateTimeFormatter
+import java.util.regex.Pattern
+import java.util.regex.Matcher
 
 plugins {
 	id "com.avast.gradle.docker-compose" version "0.17.10"
@@ -18,34 +21,23 @@ String[] databasePartitioningCompatibleServiceNames = ["mysql", "postgres"]
 File projectDir = project.projectDir as File
 
 class Config {
+	public boolean clearVolumeData = false;
 	public int clusterNodes = 0
 	public List<String> composeFiles = new ArrayList<String>()
 	public String databaseName = "lportal"
 	public boolean databasePartitioningEnabled = false
 	public String dataDirectory = "data"
+	public boolean documentLibraryFileListOnly = false
 	public List<String> hotfixURLs = new ArrayList<String>()
 	public String liferayDockerImageId = ""
+	public String liferayLXCRepositoryPath = "../liferay-lxc"
+	public String liferayUserPassword = "test"
 	public String namespace = "lrswde"
 	public List<String> services = new ArrayList<String>()
 
 	@Override
 	public String toString() {
-
-		return """
-
-Config:
-------------------------
-clusterNodes: ${clusterNodes}
-composeFiles: ${composeFiles}
-databaseName: ${databaseName}
-databasePartitioningEnabled: ${databasePartitioningEnabled}
-dataDirectory: ${dataDirectory}
-hotfixURLs: ${hotfixURLs}
-liferayDockerImageId: ${liferayDockerImageId}
-namespace: ${namespace}
-services: ${services}
-
-"""
+		return "${Config.class.declaredFields.findAll{ !it.synthetic }*.name.collect { "${it}: ${this[it]}" }.join("\n")}"
 	}
 }
 
@@ -53,12 +45,16 @@ Config config = new Config()
 
 config.composeFiles.add("docker-compose.yaml")
 
+String clearVolumeData = project.getProperty("lr.docker.environment.clear.volume.data")
 Integer clusterNodes = project.getProperty("lr.docker.environment.cluster.nodes") as Integer
-def composeFiles = toList(project.getProperty("lr.docker.environment.compose.files"))
+List composeFiles = toList(project.getProperty("lr.docker.environment.compose.files"))
 String databaseName = project.getProperty("lr.docker.environment.database.name")
 String databasePartitioningEnabled = project.getProperty("lr.docker.environment.database.partitioning.enabled")
 String dataDirectory = project.getProperty("lr.docker.environment.data.directory")
+String documentLibraryFileListOnly = project.getProperty("lr.docker.environment.liferay.document.library.file.list.only")
 List hotfixURLs = toList(project.getProperty("lr.docker.environment.hotfix.urls"))
+String liferayLXCRepositoryPath = project.getProperty("lr.docker.environment.liferay-lxc.repository.path")
+String liferayUserPassword = project.getProperty("lr.docker.environment.liferay.user.password")
 String namespace = project.getProperty("lr.docker.environment.namespace")
 List services = project.properties.findAll {
 	it.key =~ /^lr.docker.environment.service.enabled\[\w+\]$/
@@ -66,6 +62,10 @@ List services = project.properties.findAll {
 	it.value =~ /true|1/
 }.collect {
 	it.key.substring(it.key.indexOf("[") + 1, it.key.indexOf("]"))
+}
+
+if (clearVolumeData != null) {
+	config.clearVolumeData = clearVolumeData.toBoolean()
 }
 
 if (clusterNodes != null) {
@@ -84,8 +84,20 @@ if (dataDirectory != null && dataDirectory.length() > 0) {
 	config.dataDirectory = dataDirectory
 }
 
+if (documentLibraryFileListOnly != null) {
+	config.documentLibraryFileListOnly = documentLibraryFileListOnly.toBoolean()
+}
+
 if (!hotfixURLs.isEmpty()) {
 	config.hotfixURLs = hotfixURLs
+}
+
+if (liferayLXCRepositoryPath != null) {
+	config.liferayLXCRepositoryPath = liferayLXCRepositoryPath
+}
+
+if (liferayUserPassword != null) {
+	config.liferayUserPassword = liferayUserPassword
 }
 
 if (namespace != null) {
@@ -151,22 +163,703 @@ List<String> serviceComposeFiles = config.services.collect {
 
 config.composeFiles.addAll(serviceComposeFiles)
 
-tasks.register("exportContainerData", DockerCopyFileFromContainer) {
-	containerId = "${config.namespace}-data-helper"
+Closure<String> waitForCommand = {
+	String command ->
+
+	StringBuffer err = new StringBuffer()
+	StringBuffer out = new StringBuffer()
+
+	Process process = ['bash', '-c', command].execute()
+
+	process.waitForProcessOutput(out, err)
+
+	if (process.exitValue() != 0) {
+		throw new GradleException("Process exit code ${process.exitValue()}: ${err.toString()}")
+	}
+
+	if (err.length() > 0) {
+		System.err.println err.toString()
+	}
+
+	return out.toString()
+}
+
+Closure<List<String>> getExistingVolumeNames = {
+	String prefix ->
+
+	JsonSlurper jsonSlurper = new JsonSlurper()
+
+	List<String> volumeNames = []
+
+	waitForCommand("docker volume ls --filter name=^${prefix} --format json").eachLine {
+		String line ->
+
+		volumeNames.add(jsonSlurper.parseText(line)["Name"])
+	}
+
+	return volumeNames
+}
+
+Closure<List<Map<File, String>>> getEligibleVolumeBackups = {
+	String prefix, List<String> existingVolumeNames, File[] candidates ->
+
+	return candidates.collect {
+		File candidate ->
+
+		List<File> tarFiles = candidate.listFiles().findAll {
+			it.getName().endsWith(".tar") || it.getName().endsWith(".tar.gz")
+		}
+
+		Map<String, String> eligibleVolumeBackups = [:]
+
+		tarFiles.each {
+			String volumeName = prefix + it.getName().substring(0, it.getName().length() - 4)
+
+			if (existingVolumeNames.contains(volumeName)) {
+				eligibleVolumeBackups.put(it, volumeName)
+			}
+		}
+
+		return eligibleVolumeBackups
+	}.findAll {
+		!it.isEmpty()
+	}
+}
+
+Closure<Void> waitForContainer = {
+	String serviceName, String containerName ->
+
+	waitForCommand("docker compose up -d ${serviceName}")
+
+	String status = null;
+
+	do {
+		if (status != null) {
+			Thread.sleep(10000)
+		}
+
+		String logs = waitForCommand("docker compose logs ${serviceName} --since=10s")
+
+		if (logs.length() > 0) {
+			println logs
+		}
+
+		status = waitForCommand("docker inspect --format='{{json .State.Health.Status}}' ${containerName}")
+	}
+	while (!status.trim().equals("\"healthy\""))
+}
+
+tasks.register("dockerCreate") {
+	doFirst {
+		waitForCommand("docker compose create")
+	}
+}
+
+tasks.register("exportContainerData") {
+	doFirst {
+		String prefix = "${config.namespace.toLowerCase()}_"
+
+		DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd.HHmmss").withZone(ZoneId.systemDefault())
+
+		String exportPath = new File(projectDir, "exported_data/data_${config.namespace}_${formatter.format(Instant.now())}").getAbsolutePath()
+
+		getExistingVolumeNames(prefix).each {
+			String volumeName ->
+
+			String backupFileName = "${volumeName.substring(prefix.length())}.tar"
+
+			if (volumeName.endsWith("_liferay-data-volume") && config.documentLibraryFileListOnly) {
+				backupFileName = "${backupFileName}.gz"
+				waitForCommand("docker run --rm -v ${volumeName}:/source -v ${exportPath}:/target busybox:latest sh -c 'cd /source; find . -type d | sort | sed \"s@^@/tmp/@g\" | xargs mkdir -p; find . -type f | sed \"s@^@/tmp/@g\" | xargs touch; tar c -zf /target/${backupFileName} -C /tmp .'")
+			}
+			else {
+				println "Creating backup of volume ${volumeName} in ${exportPath}/${backupFileName}"
+				waitForCommand("docker run --rm -v ${volumeName}:/source -v ${exportPath}:/target busybox:latest tar cf /target/${backupFileName} -C /source .")
+			}
+
+			println "Created backup of volume ${volumeName} in ${exportPath}/${backupFileName}"
+		}
+	}
+}
+
+Closure<Void> restoreVolume = {
+	String volumeName, File backupFile, boolean importFileListOnly ->
+
+	String importPath = backupFile.getAbsolutePath()
+
+	if (importPath.endsWith(".tar")) {
+		if (importFileListOnly) {
+			println "Restoring ${volumeName} from ${importPath} (file list only)"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar busybox:latest sh -c 'cd target; tar t -f /source.tar | grep \"/\$\" | sort | xargs mkdir -p; tar t -f /source.tar | grep -v \"/\$\" | xargs touch'")
+		}
+		else {
+			println "Restoring volume ${volumeName} from ${importPath}"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar busybox:latest tar x -f /source.tar -C /target/")
+		}
+
+		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/")
+
+		println "Restored volume ${volumeName} from ${importPath}"
+	}
+	else if (importPath.endsWith(".tar.gz")) {
+		if (importFileListOnly) {
+			println "Restoring ${volumeName} from ${importPath} (file list only)"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar.gz busybox:latest sh -c 'cd target; tar t -zf /source.tar.gz | grep \"/\$\" | sort | xargs mkdir -p; tar t -zf /source.tar.gz | grep -v \"/\$\" | xargs touch'")
+		}
+		else {
+			println "Restoring volume ${volumeName} from ${importPath}"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar.gz busybox:latest tar x -zf /source.tar.gz -C /target/")
+		}
+
+		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/")
+
+		println "Restored volume ${volumeName} from ${importPath}"
+	}
+	else if (backupFile.isDirectory()) {
+		if (importFileListOnly) {
+			println "Copying directory ${importPath} to ${volumeName} (file list only)"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source busybox:latest sh -c 'cd /source; find . -type d | sort | sed \"s@^@/target/@g\" | xargs mkdir -p; find . -type f | sed \"s@^@/target/@g\" | xargs touch'")
+		}
+		else {
+			println "Copying directory ${importPath} to ${volumeName}"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source busybox:latest sh -c 'cp --no-clobber --recursive /source/* /target/'")
+		}
+
+		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/")
+	}
+	else {
+		String fileName = backupFile.getName()
+
+		if (importFileListOnly) {
+			println "Copying file ${importPath} to ${volumeName}"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v busybox:latest touch /target/${fileName}")
+		}
+		else {
+			println "Copying file ${importPath} to ${volumeName} (file list only)"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source/${fileName} busybox:latest sh -c 'cp --no-clobber /source/* /target/'")
+		}
+
+		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/${fileName}")
+
+		println "Copied file ${importPath} to ${volumeName}"
+	}
+}
+
+tasks.register("importContainerData") {
+	dependsOn ":buildDockerImage"
+	dependsOn dockerCreate
 
 	doFirst {
-		mkdir hostPath.get()
+		String prefix = "${config.namespace.toLowerCase()}_"
+
+		List<String> existingVolumeNames = getExistingVolumeNames(prefix)
+
+		List<Map<File, String>> volumeBackups = []
+
+		if (dataDirectory.length() > 0) {
+			File dataFolder = new File(projectDir, dataDirectory)
+
+			if (dataFolder.exists() && dataFolder.isDirectory()) {
+				volumeBackups = getEligibleVolumeBackups(prefix, existingVolumeNames, [dataFolder] as File[])
+
+				if (volumeBackups.isEmpty()) {
+					volumeBackups = getEligibleVolumeBackups(prefix, existingVolumeNames, dataFolder.listFiles())
+				}
+			}
+		}
+
+		if (volumeBackups.isEmpty()) {
+			File exportedDataFolder = new File(projectDir, "exported_data")
+
+			if (exportedDataFolder.exists() && exportedDataFolder.isDirectory()) {
+				volumeBackups = getEligibleVolumeBackups(prefix, existingVolumeNames, exportedDataFolder.listFiles())
+			}
+		}
+
+		if (volumeBackups.isEmpty()) {
+			throw new GradleException("Please set lr.docker.environment.data.directory in gradle.properties to a folder that contains backups")
+		}
+		else if (volumeBackups.size() > 1) {
+			throw new GradleException("Multiple exported container data folders found, please set lr.docker.environment.data.directory in gradle.properties")
+		}
+
+		volumeBackups[0].each {
+			File backupFile, String volumeName ->
+
+			restoreVolume(volumeName, backupFile, volumeName.endsWith("_liferay-data-volume") ? config.documentLibraryFileListOnly : false)
+		}
+	}
+}
+
+Provider<String> passwordProvider = project.providers.provider {
+	waitForCommand("op item get ${opItem} --fields password --reveal")
+}
+
+Closure<Void> validateDatabaseBackupFileExtensions = {
+	File dumpsFolder ->
+
+	List<File> decryptedBackupFiles = dumpsFolder.listFiles().findAll {
+		it.getName().endsWith(".gz") || it.getName().endsWith(".sql")
 	}
 
-	hostPath = provider {
-		DateTimeFormatter formatter = DateTimeFormatter.
-		ofPattern("yyyyMMdd.HHmmss").
-		withZone(ZoneId.systemDefault())
-
-		"exported_data/data_${config.namespace}_${formatter.format(Instant.now())}"
+	if (decryptedBackupFiles.isEmpty()) {
+		return false
 	}
 
-	remotePath = "/data/container-data"
+	decryptedBackupFiles.each {
+		if (it.getName().endsWith(".gz") && !it.getName().endsWith(".sql.gz")) {
+			String path = it.getAbsolutePath()
+			it.renameTo("${path.substring(0, path.length() - 3)}.sql.gz")
+		}
+	}
+
+	return true
+}
+
+tasks.register("decryptCloudBackupDatabase") {
+	doFirst {
+		File dumpsFolder = new File(projectDir, "dumps")
+
+		if (dumpsFolder.exists()) {
+			if (validateDatabaseBackupFileExtensions(dumpsFolder)) {
+				print("Found existing decrypted backups in ${dumpsFolder.getAbsolutePath()}")
+
+				return
+			}
+		}
+
+		File lxcFolder = new File(projectDir, "lxc")
+
+		if (!lxcFolder.exists()) {
+			throw new GradleException("Unable to identify database backup")
+		}
+
+		List<File> databaseBackupFiles = lxcFolder.listFiles().findAll {
+			!it.getName().startsWith("doclib") && it.getName().endsWith(".7z")
+		}
+
+		if (databaseBackupFiles.size() != 1) {
+			throw new GradleException("Unable to identify database backup")
+		}
+
+		println "Extracting LXC database backup"
+		waitForCommand("7z x ${databaseBackupFiles[0].getAbsolutePath()} -o${dumpsFolder.getAbsolutePath()} -p${passwordProvider.get()}")
+
+		validateDatabaseBackupFileExtensions(dumpsFolder)
+	}
+}
+
+tasks.register("decryptCloudBackupDocumentLibrary") {
+	doFirst {
+		File doclibBackupsFolder = new File(projectDir, "doclib")
+
+		if (!doclibBackupsFolder.exists()) {
+			File lxcFolder = new File(projectDir, "lxc")
+
+			if (!lxcFolder.exists()) {
+				return
+			}
+
+			List<File> doclibBackupFiles = lxcFolder.listFiles().findAll {
+				it.getName().startsWith("doclib") && it.getName().endsWith(".7z")
+			}
+
+			if (doclibBackupFiles.isEmpty()) {
+				return
+			}
+
+			if (doclibBackupFiles.size() > 1) {
+				throw new GradleException("Unable to identify document library backup")
+			}
+
+			println "Extracting LXC document library backup"
+			waitForCommand("7z x ${doclibBackupFiles[0].getAbsolutePath()} -o${doclibBackupsFolder.getAbsolutePath()} -p${passwordProvider.get()}")
+		}
+
+		File doclibFolder = doclibBackupsFolder;
+
+		while (doclibFolder.list().length == 1 && !doclibFolder.list().contains("0")) {
+			doclibFolder = doclibFolder.listFiles()[0]
+		}
+
+		if (!doclibFolder.list().contains("0")) {
+			throw new GradleException("Unable to find system folder 0 in document library backup")
+		}
+
+		if (!doclibFolder.equals(doclibBackupsFolder)) {
+			doclibFolder.listFiles().each {
+				it.renameTo(new File(doclibBackupsFolder, it.getName()).getAbsolutePath())
+			}
+
+			while (!doclibFolder.equals(doclibBackupsFolder)) {
+				doclibFolder.delete()
+
+				doclibFolder = doclibFolder.getParentFile()
+			}
+		}
+	}
+}
+
+Closure<List<String>> executeSQLQuery = {
+	String sql, String schema = null ->
+
+	if (config.services.contains("mysql")) {
+		List<String> results = []
+
+		if (schema == null) {
+			results = waitForCommand("docker compose exec -it database mysql --batch --user=root --execute=\"${sql}\"").split("\n")
+		}
+		else {
+			results = waitForCommand("docker compose exec -it database mysql --batch --user=root --database=${schema} --execute=\"${sql}\"").split("\n")
+		}
+
+		String[] columnHeaders = results[0].split("\t")
+		
+		return results.subList(1, results.size()).collect {
+			[columnHeaders, it.split("\t")].transpose().collectEntries {
+				[it[0], it[1]]
+			}
+		}
+	}
+	else if (config.services.contains("postgres")) {
+		if (schema == null) {
+			return waitForCommand("docker compose exec -it database psql -c \"${sql}\"")
+		}
+		else {
+			return waitForCommand("docker compose exec -it database psql ${schema} -c \"${sql}\"")
+		}
+	}
+	else {
+		throw new GradleException("Database service not detected")
+	}
+}
+
+Closure<Boolean> copyLiferayLXCRepositoryConfiguration
+
+copyLiferayLXCRepositoryConfiguration = {
+	File configFolder, String sourceName, String targetName ->
+
+	File sourceFile = new File(configFolder, sourceName)
+
+	if (!sourceFile.exists()) {
+		return false
+	}
+
+	File targetFile = new File(new File(projectDir, "configs"), targetName)
+
+	if (sourceFile.isDirectory()) {
+		for (String fileName : sourceFile.list()) {
+			copyLiferayLXCRepositoryConfiguration(sourceFile, fileName, "${targetName}/${fileName}".toString())
+		}
+	}
+	else {
+		targetFile.getParentFile().mkdirs()
+
+		Files.copy(sourceFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+	}
+
+	return true
+}
+
+Closure<Boolean> updateGradlePropertiesWithLiferayVersion = {
+	String environmentName ->
+
+	File environmentDescriptorFile = new File(new File(projectDir, config.liferayLXCRepositoryPath), "automation/environment-descriptors/${environmentName}.json")
+
+	if (!environmentDescriptorFile.exists()) {
+		return false
+	}
+
+	JsonSlurper jsonSlurper = new JsonSlurper()
+
+	Object environmentDescriptor = jsonSlurper.parse(environmentDescriptorFile)
+
+	String liferayImage = environmentDescriptor["liferay-image"]
+	String liferayHotfix = environmentDescriptor["hotfix"]
+
+	Pattern releasePattern = ~'[0-9]+\\.q[1-4]\\.[0-9]+'
+
+	Matcher releaseMatcher = releasePattern.matcher(liferayImage)
+
+	if (!releaseMatcher.find()) {
+		println "did not match ${liferayImage}"
+		return false
+	}
+
+	String release = releaseMatcher.group()
+
+	if ((release.indexOf(".q1") != -1) && !release.startsWith("2024.")) {
+		release = release + "-lts"
+	}
+
+	String workspaceProduct = "dxp-${release}"
+	String liferayHotfixURL = "https://releases-cdn.liferay.com/dxp/hotfix/${release}/liferay-dxp-${release}-${liferayHotfix}.zip"
+
+	File gradlePropertiesFile = new File(projectDir, "gradle.properties")
+
+	List<String> gradlePropertiesLines = []
+	
+	gradlePropertiesFile.eachLine {
+		if (it.startsWith("liferay.workspace.product=")) {
+			gradlePropertiesLines.add("liferay.workspace.product=${workspaceProduct}")
+		}
+		else if (it.startsWith("liferay.workspace.docker.image.liferay=")) {
+			gradlePropertiesLines.add("liferay.workspace.docker.image.liferay=${liferayImage}")
+		}
+		else if (it.startsWith("lr.docker.environment.hotfix.urls=")) {
+			gradlePropertiesLines.add("lr.docker.environment.hotfix.urls=${liferayHotfixURL}")
+		}
+		else {
+			gradlePropertiesLines.add(it)
+		}
+	}
+
+	gradlePropertiesFile.withOutputStream {
+		BufferedOutputStream outputStream ->
+
+		gradlePropertiesLines.each {
+			outputStream << it << "\n"
+		}
+	}
+
+	return true
+}
+
+Closure<Void> copyLiferayLXCRepositoryConfigurations = {
+	Map<String, String> defaultCompanyVirtualHost, List<String> includeAndOverride ->
+
+	String expectedHostName = defaultCompanyVirtualHost["hostname"].substring(0, defaultCompanyVirtualHost["hostname"].length() - ".localhost".length())
+
+	List<File> envConfigs = new File(projectDir, "${config.liferayLXCRepositoryPath}/liferay/configs").listFiles().findAll {
+		File portalEnvProperties = new File(it, "portal-env.properties")
+
+		if (!portalEnvProperties.exists()) {
+			return false
+		}
+
+		String portalEnvPropertiesText = portalEnvProperties.text
+
+		return portalEnvPropertiesText.contains("company.default.web.id=${defaultCompanyVirtualHost["webId"]}") &&
+			portalEnvPropertiesText.contains("company.default.virtual.host.name=${expectedHostName}")
+	}
+
+	envConfigs.each {
+		if (copyLiferayLXCRepositoryConfiguration(it, "portal-env.properties", "common/properties/lxc-portal-env-${it.getName()}.properties")) {
+			includeAndOverride.add("./properties/lxc-portal-env-${it.getName()}.properties")
+
+			println "Copied ${it.getName()}/portal-env.properties from liferay-lxc repository clone"
+		}
+
+		if (copyLiferayLXCRepositoryConfiguration(it, "scripts", "docker")) {
+			println "Copied ${it.getName()}/scripts from liferay-lxc repository clone"
+		}
+
+		if (copyLiferayLXCRepositoryConfiguration(it, "osgi", "common/osgi")) {
+			println "Copied ${it.getName()}/osgi from liferay-lxc repository clone"
+		}
+
+		if (updateGradlePropertiesWithLiferayVersion(it.getName())) {
+			println "Updated gradle.properties with version from ${it.getName()}"
+		}
+	}
+
+	new File(projectDir, "configs/common/properties/lxc.properties").text = """
+database.partition.enabled=true
+database.partition.thread.pool.enabled=true
+company.default.web.id=${defaultCompanyVirtualHost["webId"]}
+company.default.virtual.host.name=${defaultCompanyVirtualHost["hostname"]}
+		"""
+
+	includeAndOverride.add("./properties/lxc.properties")
+}
+
+Closure<String> updateDefaultVirtualHost = {
+	List<Map<String, String>> companyVirtualHosts ->
+
+	File portalExtPropertiesFile = new File(projectDir, "configs/common/portal-ext.properties")
+
+	String propertyDefaultWebId = null
+
+	List<String> propertiesLines = []
+	List<String> includeAndOverride = []
+
+	portalExtPropertiesFile.eachLine {
+		String key = it.trim().split("=")[0]
+
+		if (key.equals("company.default.web.id")) {
+			defaultWebId = it.split("=")[1].trim()
+		}
+		else if (key.equals("include-and-override")) {
+			String file = it.split("=")[1].trim()
+
+			if (!file.contains("/lxc")) {
+				includeAndOverride.add(file)
+			}
+		}
+		else {
+			propertiesLines.add(it)
+		}
+	}
+
+	Map<String, String> defaultCompanyVirtualHost = null
+
+	if (databasePartitioningEnabled) {
+		String defaultCompanyId = executeSQLQuery("select companyId from Company where webId like 'admin-%.lxc.liferay.com'", config.databaseName)[0]["companyId"]
+
+		defaultCompanyVirtualHost = companyVirtualHosts.find {
+			it["companyId"] == defaultCompanyId
+		}
+	}
+	else if (companyVirtualHosts.size() == 1) {
+		defaultCompanyVirtualHost = companyVirtualHosts[0]
+	}
+	else if (propertyDefaultWebId != null) {
+		defaultCompanyVirtualHost = companyVirtualHosts.find {
+			it["webId"] == propertyDefaultWebId
+		}
+	}
+	else {
+		defaultCompanyVirtualHost = companyVirtualHosts.find {
+			it["webId"] == "liferay.com"
+		}
+	}
+
+	if (defaultCompanyVirtualHost == null) {
+		throw new GradleException("Unable to auto-detect company.default.web.id, please set it manually in configs/common/portal-ext.properties manually")
+	}
+
+	if (databasePartitioningEnabled) {
+		copyLiferayLXCRepositoryConfigurations(defaultCompanyVirtualHost, includeAndOverride)
+	}
+
+	portalExtPropertiesFile.withOutputStream {
+		BufferedOutputStream outputStream ->
+
+		includeAndOverride.each {
+			outputStream << "include-and-override=" << it << "\n"
+		}
+
+		propertiesLines.each {
+			outputStream << it << "\n"
+		}
+	}
+
+	return defaultCompanyVirtualHost["webId"]
+}
+
+Closure<Void> resetLiferayUserPasswords = {
+	Map<String, String> virtualHost, String schema ->
+
+	String companyId = virtualHost["companyId"]
+	String hostname = virtualHost["hostname"]
+
+	println ""
+
+	executeSQLQuery("update User_ set password_ = '${config.liferayUserPassword}', passwordEncrypted = false where companyId = ${companyId}", schema)
+
+	println "Reset all user passwords to '${config.liferayUserPassword}' for ${hostname}"
+
+	List results = executeSQLQuery("select screenName, emailAddress from User_ where companyId = ${companyId} and userId in (select userId from Users_Roles where roleId in (select roleId from Role_ where name = 'Administrator'))", schema)
+	
+	if (results.isEmpty()) {
+		println("Unable to detect users explicitly granted the Administrator role")
+	}
+	else {
+		println("Detected the following users explicitly granted the Administrator role")
+
+		results.each {
+			println " - ${it["screenName"]} (${it["emailAddress"]})"
+		}
+	}
+}
+
+tasks.register("updateCloudBackupDatabaseForLocalDevelopment") {
+	doFirst {
+		executeSQLQuery("update VirtualHost set hostname = concat(hostname, '.localhost') where hostname not like '%.localhost'", config.databaseName)
+		
+		List<Map<String, String>> companyVirtualHosts = executeSQLQuery("select companyId, hostname, webId from VirtualHost inner join Company using (companyId) where layoutSetId = 0", config.databaseName)
+
+		String defaultWebId = updateDefaultVirtualHost(companyVirtualHosts)
+
+		companyVirtualHosts.each {
+			try {
+				resetLiferayUserPasswords(it, databasePartitioningEnabled && it["webId"] != defaultWebId ? "lpartition_${it["companyId"]}" : config.databaseName)
+			}
+			catch (Exception e) {
+				println "Unable to update ${it["hostname"]}: ${e.getMessage()}"
+			}
+		}
+	}
+}
+
+tasks.register("importCloudBackupDatabase") {
+	dependsOn ":buildDockerImage"
+	dependsOn decryptCloudBackupDatabase
+
+	onlyIf {
+		config.services.contains("mysql")
+	}
+
+	doFirst {
+		println "Loading LXC database backup into database container"
+		waitForCommand("docker compose build database")
+
+		if (config.services.contains("mysql")) {
+			Map<String, String> oldVariables = [
+				"max_allowed_packet": String.valueOf(1L << 26),
+				"autocommit": "1",
+				"unique_checks": "1",
+				"foreign_key_checks": "1",
+				"innodb_stats_auto_recalc": "1",
+			]
+
+			Map<String, String> newVariables = [
+				"max_allowed_packet": String.valueOf(1L << 30),
+				"autocommit": "0",
+				"unique_checks": "0",
+				"foreign_key_checks": "0",
+				"innodb_stats_auto_recalc": "0",
+			]
+
+			new File(projectDir, "dumps/0.sql").withOutputStream {
+				BufferedOutputStream initSQLOutputStream ->
+
+				initSQLOutputStream << newVariables.collect { "SET GLOBAL ${it.key}=${it.value};" }.join("\n") << ";"
+			}
+
+			waitForContainer("database", "${config.namespace}-database")
+			executeSQLQuery(oldVariables.collect { "SET GLOBAL ${it.key}=${it.value};\n" }.join(""))
+
+			if (databasePartitioningEnabled) {
+				executeSQLQuery(["lportal", "dxpcloud", "cloudsqlimport"].collect {
+					"create user if not exists ${it} identified by 'lportal';\ngrant all on *.* to '${it}'@'%';\n"
+				}.join(""))
+			}
+		}
+
+		println "Loaded LXC database backup into database container"
+	}
+
+	finalizedBy updateCloudBackupDatabaseForLocalDevelopment
+}
+
+tasks.register("importCloudBackupDocumentLibrary") {
+	dependsOn ":buildDockerImage"
+	dependsOn decryptCloudBackupDocumentLibrary
+	dependsOn dockerCreate
+
+	onlyIf {
+		useLiferay
+	}
+
+	doFirst {
+		restoreVolume("${config.namespace.toLowerCase()}_liferay-data-volume", new File(projectDir, "doclib"), config.documentLibraryFileListOnly)
+	}
+}
+
+tasks.register("importCloudBackup") {
+	dependsOn importCloudBackupDatabase
+	dependsOn importCloudBackupDocumentLibrary
 }
 
 tasks.register("prepareHotfixes", Download) {
@@ -198,6 +891,9 @@ tasks.register("shareWorkspace", Zip) {
 	exclude ".gitignore"
 	exclude ".git"
 	exclude ".gradle"
+	exclude "doclib"
+	exclude "dumps"
+	exclude "lxc"
 	exclude "shared_workspaces"
 	exclude {
 		it.relativePath.pathString.startsWith("exported_data/") &&
@@ -238,7 +934,7 @@ composeUp {
 	}
 
 	doFirst {
-		println "Using config: ${config}"
+		println "Using config:\n${config}"
 	}
 
 	onlyIf {
@@ -284,8 +980,7 @@ dockerCompose {
 
 	projectName = config.namespace
 
-	// DEBUG: Set to false to retain volume data on restart
-	removeVolumes = true
+	removeVolumes = config.clearVolumeData
 
 	tcpPortsToIgnoreWhenWaiting = [8000, 11311]
 	useComposeFiles = config.composeFiles
