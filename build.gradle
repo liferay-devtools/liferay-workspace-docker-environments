@@ -1,5 +1,3 @@
-import com.bmuschko.gradle.docker.tasks.container.DockerCopyFileFromContainer
-
 import de.undercouch.gradle.tasks.download.Download
 
 import groovy.json.JsonSlurper
@@ -136,22 +134,179 @@ List<String> serviceComposeFiles = config.services.collect {
 
 config.composeFiles.addAll(serviceComposeFiles)
 
-tasks.register("exportContainerData", DockerCopyFileFromContainer) {
-	containerId = "${config.namespace}-data-helper"
+Closure<String> waitForCommand = {
+	String command ->
+
+	StringBuffer err = new StringBuffer()
+	StringBuffer out = new StringBuffer()
+
+	Process process = ['bash', '-c', command].execute()
+
+	process.waitForProcessOutput(out, err)
+
+	if (process.exitValue() != 0) {
+		throw new GradleException("Process exit code ${process.exitValue()}: ${err.toString()}")
+	}
+
+	if (err.length() > 0) {
+		System.err.println err.toString()
+	}
+
+	return out.toString()
+}
+
+Closure<List<String>> getExistingVolumeNames = {
+	String prefix ->
+
+	JsonSlurper jsonSlurper = new JsonSlurper()
+
+	List<String> volumeNames = []
+
+	waitForCommand("docker volume ls --filter name=^${prefix} --format json").eachLine {
+		String line ->
+
+		volumeNames.add(jsonSlurper.parseText(line)["Name"])
+	}
+
+	return volumeNames
+}
+
+Closure<List<Map<File, String>>> getEligibleVolumeBackups = {
+	String prefix, List<String> existingVolumeNames, File[] candidates ->
+
+	return candidates.collect {
+		File candidate ->
+
+		List<File> tarFiles = candidate.listFiles().findAll {
+			it.getName().endsWith(".tar") || it.getName().endsWith(".tar.gz")
+		}
+
+		Map<String, String> eligibleVolumeBackups = [:]
+
+		tarFiles.each {
+			String volumeName = prefix + it.getName().substring(0, it.getName().length() - 4)
+
+			if (existingVolumeNames.contains(volumeName)) {
+				eligibleVolumeBackups.put(it, volumeName)
+			}
+		}
+
+		return eligibleVolumeBackups
+	}.findAll {
+		!it.isEmpty()
+	}
+}
+
+tasks.register("dockerCreate") {
+	doFirst {
+		waitForCommand("docker compose create")
+	}
+}
+
+tasks.register("exportContainerData") {
+	doFirst {
+		String prefix = "${config.namespace.toLowerCase()}_"
+
+		DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd.HHmmss").withZone(ZoneId.systemDefault())
+
+		String exportPath = new File(projectDir, "exported_data/data_${config.namespace}_${formatter.format(Instant.now())}").getAbsolutePath()
+
+		getExistingVolumeNames(prefix).each {
+			String volumeName ->
+
+			String backupFileName = "${volumeName.substring(prefix.length())}.tar"
+
+			println "Creating backup of volume ${volumeName} in ${exportPath}/${backupFileName}"
+			waitForCommand("docker run --rm -v ${volumeName}:/source -v ${exportPath}:/target busybox:latest tar cf /target/${backupFileName} -C /source .")
+
+			println "Created backup of volume ${volumeName} in ${exportPath}/${backupFileName}"
+		}
+	}
+}
+
+Closure<Void> restoreVolume = {
+	String volumeName, File backupFile ->
+
+	String importPath = backupFile.getAbsolutePath()
+
+	if (importPath.endsWith(".tar")) {
+		println "Restoring volume ${volumeName} from ${importPath}"
+		waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar busybox:latest tar x -f /source.tar -C /target/")
+
+		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/")
+
+		println "Restored volume ${volumeName} from ${importPath}"
+	}
+	else if (importPath.endsWith(".tar.gz")) {
+		println "Restoring volume ${volumeName} from ${importPath}"
+		waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar.gz busybox:latest tar x -zf /source.tar.gz -C /target/")
+
+		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/")
+
+		println "Restored volume ${volumeName} from ${importPath}"
+	}
+	else if (backupFile.isDirectory()) {
+		println "Copying directory ${importPath} to ${volumeName}"
+		waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source busybox:latest sh -c 'cp --no-clobber --recursive /source/* /target/'")
+
+		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/")
+	}
+	else {
+		String fileName = backupFile.getName()
+
+		println "Copying file ${importPath} to ${volumeName} (file list only)"
+		waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source/${fileName} busybox:latest sh -c 'cp --no-clobber /source/* /target/'")
+
+		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/${fileName}")
+
+		println "Copied file ${importPath} to ${volumeName}"
+	}
+}
+
+tasks.register("importContainerData") {
+	dependsOn ":buildDockerImage"
+	dependsOn dockerCreate
 
 	doFirst {
-		mkdir hostPath.get()
+		String prefix = "${config.namespace.toLowerCase()}_"
+
+		List<String> existingVolumeNames = getExistingVolumeNames(prefix)
+
+		List<Map<File, String>> volumeBackups = []
+
+		if (dataDirectory.length() > 0) {
+			File dataFolder = new File(projectDir, dataDirectory)
+
+			if (dataFolder.exists() && dataFolder.isDirectory()) {
+				volumeBackups = getEligibleVolumeBackups(prefix, existingVolumeNames, [dataFolder] as File[])
+
+				if (volumeBackups.isEmpty()) {
+					volumeBackups = getEligibleVolumeBackups(prefix, existingVolumeNames, dataFolder.listFiles())
+				}
+			}
+		}
+
+		if (volumeBackups.isEmpty()) {
+			File exportedDataFolder = new File(projectDir, "exported_data")
+
+			if (exportedDataFolder.exists() && exportedDataFolder.isDirectory()) {
+				volumeBackups = getEligibleVolumeBackups(prefix, existingVolumeNames, exportedDataFolder.listFiles())
+			}
+		}
+
+		if (volumeBackups.isEmpty()) {
+			throw new GradleException("Please set lr.docker.environment.data.directory in gradle.properties to a folder that contains backups")
+		}
+		else if (volumeBackups.size() > 1) {
+			throw new GradleException("Multiple exported container data folders found, please set lr.docker.environment.data.directory in gradle.properties")
+		}
+
+		volumeBackups[0].each {
+			File backupFile, String volumeName ->
+
+			restoreVolume(volumeName, backupFile)
+		}
 	}
-
-	hostPath = provider {
-		DateTimeFormatter formatter = DateTimeFormatter.
-		ofPattern("yyyyMMdd.HHmmss").
-		withZone(ZoneId.systemDefault())
-
-		"exported_data/data_${config.namespace}_${formatter.format(Instant.now())}"
-	}
-
-	remotePath = "/data/container-data"
 }
 
 tasks.register("prepareHotfixes", Download) {
