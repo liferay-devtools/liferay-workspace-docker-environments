@@ -21,6 +21,7 @@ class Config {
 	public String databaseName = "lportal"
 	public boolean databasePartitioningEnabled = false
 	public String dataDirectory = "data"
+	public boolean documentLibraryFileListOnly = false
 	public List<String> hotfixURLs = new ArrayList<String>()
 	public String liferayDockerImageId = ""
 	public String namespace = "lrswde"
@@ -41,6 +42,7 @@ def composeFiles = toList(project.getProperty("lr.docker.environment.compose.fil
 String databaseName = project.getProperty("lr.docker.environment.database.name")
 String databasePartitioningEnabled = project.getProperty("lr.docker.environment.database.partitioning.enabled")
 String dataDirectory = project.getProperty("lr.docker.environment.data.directory")
+String documentLibraryFileListOnly = project.getProperty("lr.docker.environment.liferay.document.library.file.list.only")
 List hotfixURLs = toList(project.getProperty("lr.docker.environment.hotfix.urls"))
 String namespace = project.getProperty("lr.docker.environment.namespace")
 List services = project.properties.findAll {
@@ -65,6 +67,10 @@ if (databasePartitioningEnabled != null) {
 
 if (dataDirectory != null && dataDirectory.length() > 0) {
 	config.dataDirectory = dataDirectory
+}
+
+if (documentLibraryFileListOnly != null) {
+	config.documentLibraryFileListOnly = documentLibraryFileListOnly.toBoolean()
 }
 
 if (!hotfixURLs.isEmpty()) {
@@ -216,8 +222,14 @@ tasks.register("exportContainerData") {
 
 			String backupFileName = "${volumeName.substring(prefix.length())}.tar"
 
-			println "Creating backup of volume ${volumeName} in ${exportPath}/${backupFileName}"
-			waitForCommand("docker run --rm -v ${volumeName}:/source -v ${exportPath}:/target busybox:latest tar cf /target/${backupFileName} -C /source .")
+			if (volumeName.endsWith("_liferay-data-volume") && config.documentLibraryFileListOnly) {
+				backupFileName = "${backupFileName}.gz"
+				waitForCommand("docker run --rm -v ${volumeName}:/source -v ${exportPath}:/target busybox:latest sh -c 'cd /source; find . -type d | sort | sed \"s@^@/tmp/@g\" | xargs mkdir -p; find . -type f | sed \"s@^@/tmp/@g\" | xargs touch; tar c -zf /target/${backupFileName} -C /tmp .'")
+			}
+			else {
+				println "Creating backup of volume ${volumeName} in ${exportPath}/${backupFileName}"
+				waitForCommand("docker run --rm -v ${volumeName}:/source -v ${exportPath}:/target busybox:latest tar cf /target/${backupFileName} -C /source .")
+			}
 
 			println "Created backup of volume ${volumeName} in ${exportPath}/${backupFileName}"
 		}
@@ -225,37 +237,61 @@ tasks.register("exportContainerData") {
 }
 
 Closure<Void> restoreVolume = {
-	String volumeName, File backupFile ->
+	String volumeName, File backupFile, boolean importFileListOnly ->
 
 	String importPath = backupFile.getAbsolutePath()
 
 	if (importPath.endsWith(".tar")) {
-		println "Restoring volume ${volumeName} from ${importPath}"
-		waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar busybox:latest tar x -f /source.tar -C /target/")
+		if (importFileListOnly) {
+			println "Restoring ${volumeName} from ${importPath} (file list only)"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar busybox:latest sh -c 'cd target; tar t -f /source.tar | grep \"/\$\" | sort | xargs mkdir -p; tar t -f /source.tar | grep -v \"/\$\" | xargs touch'")
+		}
+		else {
+			println "Restoring volume ${volumeName} from ${importPath}"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar busybox:latest tar x -f /source.tar -C /target/")
+		}
 
 		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/")
 
 		println "Restored volume ${volumeName} from ${importPath}"
 	}
 	else if (importPath.endsWith(".tar.gz")) {
-		println "Restoring volume ${volumeName} from ${importPath}"
-		waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar.gz busybox:latest tar x -zf /source.tar.gz -C /target/")
+		if (importFileListOnly) {
+			println "Restoring ${volumeName} from ${importPath} (file list only)"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar.gz busybox:latest sh -c 'cd target; tar t -zf /source.tar.gz | grep \"/\$\" | sort | xargs mkdir -p; tar t -zf /source.tar.gz | grep -v \"/\$\" | xargs touch'")
+		}
+		else {
+			println "Restoring volume ${volumeName} from ${importPath}"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source.tar.gz busybox:latest tar x -zf /source.tar.gz -C /target/")
+		}
 
 		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/")
 
 		println "Restored volume ${volumeName} from ${importPath}"
 	}
 	else if (backupFile.isDirectory()) {
-		println "Copying directory ${importPath} to ${volumeName}"
-		waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source busybox:latest sh -c 'cp --no-clobber --recursive /source/* /target/'")
+		if (importFileListOnly) {
+			println "Copying directory ${importPath} to ${volumeName} (file list only)"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source busybox:latest sh -c 'cd /source; find . -type d | sort | sed \"s@^@/target/@g\" | xargs mkdir -p; find . -type f | sed \"s@^@/target/@g\" | xargs touch'")
+		}
+		else {
+			println "Copying directory ${importPath} to ${volumeName}"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source busybox:latest sh -c 'cp --no-clobber --recursive /source/* /target/'")
+		}
 
 		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/")
 	}
 	else {
 		String fileName = backupFile.getName()
 
-		println "Copying file ${importPath} to ${volumeName} (file list only)"
-		waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source/${fileName} busybox:latest sh -c 'cp --no-clobber /source/* /target/'")
+		if (importFileListOnly) {
+			println "Copying file ${importPath} to ${volumeName}"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v busybox:latest touch /target/${fileName}")
+		}
+		else {
+			println "Copying file ${importPath} to ${volumeName} (file list only)"
+			waitForCommand("docker run --rm -v ${volumeName}:/target -v ${importPath}:/source/${fileName} busybox:latest sh -c 'cp --no-clobber /source/* /target/'")
+		}
 
 		println waitForCommand("docker run --rm -v ${volumeName}:/target busybox:latest du -sh /target/${fileName}")
 
@@ -304,7 +340,7 @@ tasks.register("importContainerData") {
 		volumeBackups[0].each {
 			File backupFile, String volumeName ->
 
-			restoreVolume(volumeName, backupFile)
+			restoreVolume(volumeName, backupFile, volumeName.endsWith("_liferay-data-volume") ? config.documentLibraryFileListOnly : false)
 		}
 	}
 }
