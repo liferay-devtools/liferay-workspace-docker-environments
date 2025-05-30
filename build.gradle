@@ -432,6 +432,57 @@ tasks.register("decryptCloudBackupDatabase") {
 	}
 }
 
+tasks.register("decryptCloudBackupDocumentLibrary") {
+	doFirst {
+		File doclibBackupsFolder = new File(projectDir, "doclib")
+
+		if (!doclibBackupsFolder.exists()) {
+			File lxcFolder = new File(projectDir, "lxc")
+
+			if (!lxcFolder.exists()) {
+				return
+			}
+
+			List<File> doclibBackupFiles = lxcFolder.listFiles().findAll {
+				it.getName().startsWith("doclib") && it.getName().endsWith(".7z")
+			}
+
+			if (doclibBackupFiles.isEmpty()) {
+				return
+			}
+
+			if (doclibBackupFiles.size() > 1) {
+				throw new GradleException("Unable to identify document library backup")
+			}
+
+			println "Extracting LXC document library backup"
+			waitForCommand("7z x ${doclibBackupFiles[0].getAbsolutePath()} -o${doclibBackupsFolder.getAbsolutePath()} -p${passwordProvider.get()}")
+		}
+
+		File doclibFolder = doclibBackupsFolder;
+
+		while (doclibFolder.list().length == 1 && !doclibFolder.list().contains("0")) {
+			doclibFolder = doclibFolder.listFiles()[0]
+		}
+
+		if (!doclibFolder.list().contains("0")) {
+			throw new GradleException("Unable to find system folder 0 in document library backup")
+		}
+
+		if (!doclibFolder.equals(doclibBackupsFolder)) {
+			doclibFolder.listFiles().each {
+				it.renameTo(new File(doclibBackupsFolder, it.getName()).getAbsolutePath())
+			}
+
+			while (!doclibFolder.equals(doclibBackupsFolder)) {
+				doclibFolder.delete()
+
+				doclibFolder = doclibFolder.getParentFile()
+			}
+		}
+	}
+}
+
 Closure<List<String>> executeSQLQuery = {
 	String sql, String schema = null ->
 
@@ -507,6 +558,20 @@ tasks.register("importCloudBackupDatabase") {
 	}
 }
 
+tasks.register("importCloudBackupDocumentLibrary") {
+	dependsOn ":buildDockerImage"
+	dependsOn decryptCloudBackupDocumentLibrary
+	dependsOn dockerCreate
+
+	onlyIf {
+		useLiferay
+	}
+
+	doFirst {
+		restoreVolume("${config.namespace.toLowerCase()}_liferay-data-volume", new File(projectDir, "doclib"), config.documentLibraryFileListOnly)
+	}
+}
+
 tasks.register("prepareHotfixes", Download) {
 	dest project.layout.dir(project.provider {project.file("configs/common/patching")})
 
@@ -538,7 +603,7 @@ tasks.register("shareWorkspace", Zip) {
 	exclude ".gradle"
 	exclude {
 		new File("lxc").exists() &&
-		it.relativePath.pathString.startsWith("dumps/")
+		(it.relativePath.pathString.startsWith("doclib/") || it.relativePath.pathString.startsWith("dumps/"))
 	}
 	exclude "lxc"
 	exclude "shared_workspaces"
