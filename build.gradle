@@ -2,6 +2,9 @@ import de.undercouch.gradle.tasks.download.Download
 
 import groovy.json.JsonSlurper
 
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
 import java.time.format.DateTimeFormatter
 
 plugins {
@@ -25,6 +28,7 @@ class Config {
 	public boolean documentLibraryFileListOnly = false
 	public List<String> hotfixURLs = new ArrayList<String>()
 	public String liferayDockerImageId = ""
+	public String liferayLXCRepositoryPath = "../liferay-lxc"
 	public String liferayUserPassword = "test"
 	public String namespace = "lrswde"
 	public List<String> services = new ArrayList<String>()
@@ -47,6 +51,7 @@ String databasePartitioningEnabled = project.getProperty("lr.docker.environment.
 String dataDirectory = project.getProperty("lr.docker.environment.data.directory")
 String documentLibraryFileListOnly = project.getProperty("lr.docker.environment.liferay.document.library.file.list.only")
 List hotfixURLs = toList(project.getProperty("lr.docker.environment.hotfix.urls"))
+String liferayLXCRepositoryPath = project.getProperty("lr.docker.environment.liferay-lxc.repository.path")
 String liferayUserPassword = project.getProperty("lr.docker.environment.liferay.user.password")
 String namespace = project.getProperty("lr.docker.environment.namespace")
 List services = project.properties.findAll {
@@ -83,6 +88,10 @@ if (documentLibraryFileListOnly != null) {
 
 if (!hotfixURLs.isEmpty()) {
 	config.hotfixURLs = hotfixURLs
+}
+
+if (liferayLXCRepositoryPath != null) {
+	config.liferayLXCRepositoryPath = liferayLXCRepositoryPath
 }
 
 if (liferayUserPassword != null) {
@@ -515,7 +524,78 @@ Closure<List<String>> executeSQLQuery = {
 	}
 }
 
-Closure<String> getDefaultVirtualHost = {
+Closure<Boolean> copyLiferayLXCRepositoryConfiguration
+
+copyLiferayLXCRepositoryConfiguration = {
+	File configFolder, String sourceName, String targetName ->
+
+	File sourceFile = new File(configFolder, sourceName)
+
+	if (!sourceFile.exists()) {
+		return false
+	}
+
+	File targetFile = new File(new File(projectDir, "configs"), targetName)
+
+	if (sourceFile.isDirectory()) {
+		for (String fileName : sourceFile.list()) {
+			copyLiferayLXCRepositoryConfiguration(sourceFile, fileName, "${targetName}/${fileName}".toString())
+		}
+	}
+	else {
+		targetFile.getParentFile().mkdirs()
+
+		Files.copy(sourceFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+	}
+
+	return true
+}
+
+Closure<Void> copyLiferayLXCRepositoryConfigurations = {
+	Map<String, String> defaultCompanyVirtualHost, List<String> includeAndOverride ->
+
+	String expectedHostName = defaultCompanyVirtualHost["hostname"].substring(0, defaultCompanyVirtualHost["hostname"].length() - ".localhost".length())
+
+	List<File> envConfigs = new File(projectDir, "${config.liferayLXCRepositoryPath}/liferay/configs").listFiles().findAll {
+		File portalEnvProperties = new File(it, "portal-env.properties")
+
+		if (!portalEnvProperties.exists()) {
+			return false
+		}
+
+		String portalEnvPropertiesText = portalEnvProperties.text
+
+		return portalEnvPropertiesText.contains("company.default.web.id=${defaultCompanyVirtualHost["webId"]}") &&
+			portalEnvPropertiesText.contains("company.default.virtual.host.name=${expectedHostName}")
+	}
+
+	envConfigs.each {
+		if (copyLiferayLXCRepositoryConfiguration(it, "portal-env.properties", "common/properties/lxc-portal-env-${it.getName()}.properties")) {
+			includeAndOverride.add("./properties/lxc-portal-env-${it.getName()}.properties")
+
+			println "Copied ${it.getName()}/portal-env.properties from liferay-lxc repository clone"
+		}
+
+		if (copyLiferayLXCRepositoryConfiguration(it, "scripts", "docker")) {
+			println "Copied ${it.getName()}/scripts from liferay-lxc repository clone"
+		}
+
+		if (copyLiferayLXCRepositoryConfiguration(it, "osgi", "common/osgi")) {
+			println "Copied ${it.getName()}/osgi from liferay-lxc repository clone"
+		}
+	}
+
+	new File(projectDir, "configs/common/properties/lxc.properties").text = """
+database.partition.enabled=true
+database.partition.thread.pool.enabled=true
+company.default.web.id=${defaultCompanyVirtualHost["webId"]}
+company.default.virtual.host.name=${defaultCompanyVirtualHost["hostname"]}
+		"""
+
+	includeAndOverride.add("./properties/lxc.properties")
+}
+
+Closure<String> updateDefaultVirtualHost = {
 	List<Map<String, String>> companyVirtualHosts ->
 
 	File portalExtPropertiesFile = new File(projectDir, "configs/common/portal-ext.properties")
@@ -530,6 +610,16 @@ Closure<String> getDefaultVirtualHost = {
 
 		if (key.equals("company.default.web.id")) {
 			defaultWebId = it.split("=")[1].trim()
+		}
+		else if (key.equals("include-and-override")) {
+			String file = it.split("=")[1].trim()
+
+			if (!file.contains("/lxc")) {
+				includeAndOverride.add(file)
+			}
+		}
+		else {
+			propertiesLines.add(it)
 		}
 	}
 
@@ -558,6 +648,22 @@ Closure<String> getDefaultVirtualHost = {
 
 	if (defaultCompanyVirtualHost == null) {
 		throw new GradleException("Unable to auto-detect company.default.web.id, please set it manually in configs/common/portal-ext.properties manually")
+	}
+
+	if (databasePartitioningEnabled) {
+		copyLiferayLXCRepositoryConfigurations(defaultCompanyVirtualHost, includeAndOverride)
+	}
+
+	portalExtPropertiesFile.withOutputStream {
+		BufferedOutputStream outputStream ->
+
+		includeAndOverride.each {
+			outputStream << "include-and-override=" << it << "\n"
+		}
+
+		propertiesLines.each {
+			outputStream << it << "\n"
+		}
 	}
 
 	return defaultCompanyVirtualHost["webId"]
@@ -595,7 +701,7 @@ tasks.register("updateCloudBackupDatabaseForLocalDevelopment") {
 		
 		List<Map<String, String>> companyVirtualHosts = executeSQLQuery("select companyId, hostname, webId from VirtualHost inner join Company using (companyId) where layoutSetId = 0", config.databaseName)
 
-		String defaultWebId = getDefaultVirtualHost(companyVirtualHosts)
+		String defaultWebId = updateDefaultVirtualHost(companyVirtualHosts)
 
 		companyVirtualHosts.each {
 			try {
