@@ -25,6 +25,7 @@ class Config {
 	public boolean documentLibraryFileListOnly = false
 	public List<String> hotfixURLs = new ArrayList<String>()
 	public String liferayDockerImageId = ""
+	public String liferayUserPassword = "test"
 	public String namespace = "lrswde"
 	public List<String> services = new ArrayList<String>()
 
@@ -46,6 +47,7 @@ String databasePartitioningEnabled = project.getProperty("lr.docker.environment.
 String dataDirectory = project.getProperty("lr.docker.environment.data.directory")
 String documentLibraryFileListOnly = project.getProperty("lr.docker.environment.liferay.document.library.file.list.only")
 List hotfixURLs = toList(project.getProperty("lr.docker.environment.hotfix.urls"))
+String liferayUserPassword = project.getProperty("lr.docker.environment.liferay.user.password")
 String namespace = project.getProperty("lr.docker.environment.namespace")
 List services = project.properties.findAll {
 	it.key =~ /^lr.docker.environment.service.enabled\[\w+\]$/
@@ -81,6 +83,10 @@ if (documentLibraryFileListOnly != null) {
 
 if (!hotfixURLs.isEmpty()) {
 	config.hotfixURLs = hotfixURLs
+}
+
+if (liferayUserPassword != null) {
+	config.liferayUserPassword = liferayUserPassword
 }
 
 if (namespace != null) {
@@ -509,6 +515,99 @@ Closure<List<String>> executeSQLQuery = {
 	}
 }
 
+Closure<String> getDefaultVirtualHost = {
+	List<Map<String, String>> companyVirtualHosts ->
+
+	File portalExtPropertiesFile = new File(projectDir, "configs/common/portal-ext.properties")
+
+	String propertyDefaultWebId = null
+
+	List<String> propertiesLines = []
+	List<String> includeAndOverride = []
+
+	portalExtPropertiesFile.eachLine {
+		String key = it.trim().split("=")[0]
+
+		if (key.equals("company.default.web.id")) {
+			defaultWebId = it.split("=")[1].trim()
+		}
+	}
+
+	Map<String, String> defaultCompanyVirtualHost = null
+
+	if (databasePartitioningEnabled) {
+		String defaultCompanyId = executeSQLQuery("select companyId from Company where webId like 'admin-%.lxc.liferay.com'", config.databaseName)[0]["companyId"]
+
+		defaultCompanyVirtualHost = companyVirtualHosts.find {
+			it["companyId"] == defaultCompanyId
+		}
+	}
+	else if (companyVirtualHosts.size() == 1) {
+		defaultCompanyVirtualHost = companyVirtualHosts[0]
+	}
+	else if (propertyDefaultWebId != null) {
+		defaultCompanyVirtualHost = companyVirtualHosts.find {
+			it["webId"] == propertyDefaultWebId
+		}
+	}
+	else {
+		defaultCompanyVirtualHost = companyVirtualHosts.find {
+			it["webId"] == "liferay.com"
+		}
+	}
+
+	if (defaultCompanyVirtualHost == null) {
+		throw new GradleException("Unable to auto-detect company.default.web.id, please set it manually in configs/common/portal-ext.properties manually")
+	}
+
+	return defaultCompanyVirtualHost["webId"]
+}
+
+Closure<Void> resetLiferayUserPasswords = {
+	Map<String, String> virtualHost, String schema ->
+
+	String companyId = virtualHost["companyId"]
+	String hostname = virtualHost["hostname"]
+
+	println ""
+
+	executeSQLQuery("update User_ set password_ = '${config.liferayUserPassword}', passwordEncrypted = false where companyId = ${companyId}", schema)
+
+	println "Reset all user passwords to '${config.liferayUserPassword}' for ${hostname}"
+
+	List results = executeSQLQuery("select screenName, emailAddress from User_ where companyId = ${companyId} and userId in (select userId from Users_Roles where roleId in (select roleId from Role_ where name = 'Administrator'))", schema)
+	
+	if (results.isEmpty()) {
+		println("Unable to detect users explicitly granted the Administrator role")
+	}
+	else {
+		println("Detected the following users explicitly granted the Administrator role")
+
+		results.each {
+			println " - ${it["screenName"]} (${it["emailAddress"]})"
+		}
+	}
+}
+
+tasks.register("updateCloudBackupDatabaseForLocalDevelopment") {
+	doFirst {
+		executeSQLQuery("update VirtualHost set hostname = concat(hostname, '.localhost') where hostname not like '%.localhost'", config.databaseName)
+		
+		List<Map<String, String>> companyVirtualHosts = executeSQLQuery("select companyId, hostname, webId from VirtualHost inner join Company using (companyId) where layoutSetId = 0", config.databaseName)
+
+		String defaultWebId = getDefaultVirtualHost(companyVirtualHosts)
+
+		companyVirtualHosts.each {
+			try {
+				resetLiferayUserPasswords(it, databasePartitioningEnabled && it["webId"] != defaultWebId ? "lpartition_${it["companyId"]}" : config.databaseName)
+			}
+			catch (Exception e) {
+				println "Unable to update ${it["hostname"]}: ${e.getMessage()}"
+			}
+		}
+	}
+}
+
 tasks.register("importCloudBackupDatabase") {
 	dependsOn ":buildDockerImage"
 	dependsOn decryptCloudBackupDatabase
@@ -556,6 +655,8 @@ tasks.register("importCloudBackupDatabase") {
 
 		println "Loaded LXC database backup into database container"
 	}
+
+	finalizedBy updateCloudBackupDatabaseForLocalDevelopment
 }
 
 tasks.register("importCloudBackupDocumentLibrary") {
@@ -570,6 +671,11 @@ tasks.register("importCloudBackupDocumentLibrary") {
 	doFirst {
 		restoreVolume("${config.namespace.toLowerCase()}_liferay-data-volume", new File(projectDir, "doclib"), config.documentLibraryFileListOnly)
 	}
+}
+
+tasks.register("importCloudBackup") {
+	dependsOn importCloudBackupDatabase
+	dependsOn importCloudBackupDocumentLibrary
 }
 
 tasks.register("prepareHotfixes", Download) {
