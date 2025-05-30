@@ -16,6 +16,7 @@ String[] databasePartitioningCompatibleServiceNames = ["mysql", "postgres"]
 File projectDir = project.projectDir as File
 
 class Config {
+	public boolean clearVolumeData = false;
 	public int clusterNodes = 0
 	public List<String> composeFiles = new ArrayList<String>()
 	public String databaseName = "lportal"
@@ -37,6 +38,7 @@ Config config = new Config()
 
 config.composeFiles.add("docker-compose.yaml")
 
+String clearVolumeData = project.getProperty("lr.docker.environment.clear.volume.data")
 Integer clusterNodes = project.getProperty("lr.docker.environment.cluster.nodes") as Integer
 def composeFiles = toList(project.getProperty("lr.docker.environment.compose.files"))
 String databaseName = project.getProperty("lr.docker.environment.database.name")
@@ -51,6 +53,10 @@ List services = project.properties.findAll {
 	it.value =~ /true|1/
 }.collect {
 	it.key.substring(it.key.indexOf("[") + 1, it.key.indexOf("]"))
+}
+
+if (clearVolumeData != null) {
+	config.clearVolumeData = clearVolumeData.toBoolean()
 }
 
 if (clusterNodes != null) {
@@ -460,8 +466,7 @@ dockerCompose {
 
 	projectName = config.namespace
 
-	// DEBUG: Set to false to retain volume data on restart
-	removeVolumes = true
+	removeVolumes = config.clearVolumeData
 
 	tcpPortsToIgnoreWhenWaiting = [8000, 11311]
 	useComposeFiles = config.composeFiles
