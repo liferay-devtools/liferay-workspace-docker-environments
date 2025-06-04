@@ -17,6 +17,7 @@
 **/tmp
 .gradle
 .idea
+.vscode
 /bundles
 /containerLogs
 /data/*
@@ -25,6 +26,8 @@
 /gradle-*.properties
 /helper/data
 /helper/dumps
+/liferay_data
+/lxc
 /plugins-sdk/**/classes
 /plugins-sdk/**/ivy.xml.MD5
 /plugins-sdk/**/liferay-hook.xml.processed
