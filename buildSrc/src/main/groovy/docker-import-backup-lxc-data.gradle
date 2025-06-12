@@ -1,0 +1,358 @@
+import groovy.json.JsonSlurper
+
+import java.util.regex.Pattern
+import java.util.regex.Matcher
+
+project.plugins.apply "docker-common"
+
+Closure<Boolean> validateDatabaseBackupFileExtensions = {
+	File extractedFolder ->
+
+	List<File> decryptedBackupFiles = extractedFolder.listFiles().findAll {
+		it.name.endsWith(".gz") || it.name.endsWith(".sql")
+	}
+
+	if (decryptedBackupFiles.isEmpty()) {
+		decryptedBackupFiles = extractedFolder.listFiles().findAll {
+			!it.isDirectory() && !it.name.contains(".")
+		}
+	}
+
+	if (decryptedBackupFiles.isEmpty()) {
+		return false
+	}
+
+	decryptedBackupFiles.each {
+		if (it.name.endsWith(".gz") && !it.name.endsWith(".sql.gz")) {
+			String path = it.absolutePath
+			it.renameTo("${path.substring(0, path.length() - 3)}.sql.gz")
+		}
+		else if (!it.name.contains(".")) {
+			it.renameTo("${it.absolutePath}.sql")
+		}
+	}
+
+	return true
+}
+
+Closure<File> getFirstMatchingSubFolder
+
+getFirstMatchingSubFolder = {
+	File folder, Closure<Boolean> predicate ->
+
+	if (predicate(folder)) {
+		return folder
+	}
+
+	List<File> subfolders = folder.listFiles().findAll {
+		it.isDirectory()
+	}
+
+	if (subfolders.size() != 1) {
+		return null
+	}
+
+	return getFirstMatchingSubFolder(subfolders[0], predicate)
+}
+
+Closure<Boolean> stripComponentFolders = {
+	File sourceFolder, File targetFolder ->
+
+	if (sourceFolder == null) {
+		return false
+	}
+
+	if (sourceFolder.equals(targetFolder)) {
+		return true
+	}
+
+	sourceFolder.listFiles().each {
+		it.renameTo(new File(targetFolder, it.name))
+	}
+
+	File nestedFolder = sourceFolder
+
+	while (!nestedFolder.equals(targetFolder)) {
+		nestedFolder.delete()
+
+		nestedFolder = nestedFolder.getParentFile()
+	}
+
+	return true
+}
+
+tasks.register("decryptCloudBackupDatabase") {
+	doFirst {
+		File dumpsFolder = file("dumps")
+
+		if (dumpsFolder.exists()) {
+			if (validateDatabaseBackupFileExtensions(dumpsFolder)) {
+				print("Found existing decrypted backups in ${dumpsFolder.absolutePath}")
+
+				return
+			}
+		}
+
+		File lxcFolder = file("lxc")
+
+		if (!lxcFolder.exists()) {
+			throw new GradleException("Unable to identify database backup")
+		}
+
+		List<File> databaseBackupFiles = lxcFolder.listFiles().findAll {
+			!it.name.contains("doclib") && it.name.endsWith(".7z")
+		}
+
+		if (databaseBackupFiles.isEmpty()) {
+			databaseBackupFiles = lxcFolder.listFiles().findAll {
+				!it.name.contains("doclib") && it.name.endsWith(".zip")
+			}
+		}
+
+		if (databaseBackupFiles.size() != 1) {
+			throw new GradleException("Unable to identify database backup")
+		}
+
+		println "Extracting LXC database backup"
+
+		if (config.lxcBackupPassword != null && config.lxcBackupPassword.length() > 0) {
+			waitForCommand("7z x -aos ${databaseBackupFiles[0].absolutePath} -o${dumpsFolder.absolutePath} -p${config.lxcBackupPassword}")
+		}
+		else {
+			waitForCommand("7z x -aos ${databaseBackupFiles[0].absolutePath} -o${dumpsFolder.absolutePath}")
+		}
+
+		if (!stripComponentFolders(getFirstMatchingSubFolder(dumpsFolder, validateDatabaseBackupFileExtensions), dumpsFolder)) {
+			throw new GradleException("Unable to identify database backup")
+		}
+	}
+}
+
+Closure<Boolean> containsTarFile = {
+	File extractedFolder ->
+
+	List<String> fileNames = extractedFolder.list()
+
+	if (fileNames.contains("0")) {
+		return true
+	}
+
+	return fileNames.find {
+		it.endsWith(".tar.gz") || it.endsWith(".tgz") || it.endsWith(".tar")
+	}
+}
+
+Closure<Boolean> isDocumentLibraryRoot = {
+	File extractedFolder ->
+
+	List<File> subfolders = extractedFolder.listFiles().findAll {
+		it.isDirectory()
+	}
+
+	if (subfolders.isEmpty()) {
+		return false
+	}
+
+	return subfolders.find {
+		try {
+			Long.parseLong(it.name)
+			return false
+		}
+		catch (NumberFormatException numberFormatException) {
+			return true
+		}
+	} == null
+}
+
+tasks.register("decryptCloudBackupDocumentLibrary") {
+	doFirst {
+		File doclibBackupsFolder = file("liferay_data/document_library")
+
+		if (!doclibBackupsFolder.exists()) {
+			File lxcFolder = file("lxc")
+
+			if (!lxcFolder.exists()) {
+				return
+			}
+
+			List<File> doclibBackupFiles = lxcFolder.listFiles().findAll {
+				it.name.contains("doclib") && it.name.endsWith(".7z")
+			}
+
+			if (doclibBackupFiles.isEmpty()) {
+				return
+			}
+
+			if (doclibBackupFiles.size() > 1) {
+				throw new GradleException("Unable to identify document library backup")
+			}
+
+			println "Extracting LXC document library backup"
+			waitForCommand("7z x -aos ${doclibBackupFiles[0].absolutePath} -o${doclibBackupsFolder.absolutePath} -p${config.lxcBackupPassword}")
+		}
+
+		while (stripComponentFolders(getFirstMatchingSubFolder(doclibBackupsFolder, containsTarFile), doclibBackupsFolder)) {
+			doclibBackupsFolder.listFiles().each {
+				waitForCommand("7z x -aos ${it.absolutePath} -o${doclibBackupsFolder.absolutePath}")
+				it.delete()
+			}
+		}
+
+		if (!stripComponentFolders(getFirstMatchingSubFolder(doclibBackupsFolder, isDocumentLibraryRoot), doclibBackupsFolder)) {
+			throw new GradleException("Unable to find system folder 0 in document library backup")
+		}
+	}
+}
+
+tasks.register("listAdminUsers") {
+	onlyIf {
+		config.services.contains("mysql") || config.services.contains("postgres")
+	}
+
+	doFirst {
+		forEachCompanyId {
+			String companyId, String hostname, String webId, String schema ->
+
+			List results = executeSQLQuery("select screenName, emailAddress from User_ where companyId = ${companyId} and userId in (select userId from Users_Roles where roleId in (select roleId from Role_ where name = 'Administrator'))", schema)
+
+			println "\nhttp://${hostname}:8080/c/portal/login"
+			printDatabaseAccessCommand(schema)
+
+			if (results.isEmpty()) {
+				println "Unable to detect users explicitly granted the Administrator role"
+			}
+			else {
+				println "Detected the following users explicitly granted the Administrator role"
+
+				results.each {
+					println " - ${it["screenName"]} (${it["emailAddress"]})"
+				}
+			}
+		}
+	}
+}
+
+tasks.register("updateCloudBackupDatabaseForLocalDevelopment") {
+	mustRunAfter importDatabaseDumps
+
+	onlyIf {
+		config.services.contains("mysql") || config.services.contains("postgres")
+	}
+
+	doFirst {
+		LOCAL_DEV_OSGI_CONFIGS_TO_DELETE.each {
+			executeSQLQuery("delete from Configuration_ where configurationId like '%${it}%'", config.databaseName)
+		}
+
+		forEachCompanyId {
+			String companyId, String hostname, String webId, String schema ->
+
+			executeSQLQuery("update SamlSpIdpConnection set enabled = false where companyId = ${companyId}", schema)
+		}
+
+		println "Deleted known problematic configuration entries from the database"
+
+		executeSQLQuery("update VirtualHost set hostname = concat(hostname, '.localhost') where hostname <> 'localhost' and hostname not like '%.localhost'", config.databaseName)
+
+		forEachCompanyId {
+			String companyId, String hostname, String webId, String schema ->
+
+			executeSQLQuery("update User_ set password_ = '${config.liferayUserPassword}', passwordEncrypted = false, passwordReset = false, lockout = false where companyId = ${companyId}", schema)
+		}
+
+		println "Reset all user passwords to '${config.liferayUserPassword}'"
+	}
+}
+
+tasks.register("checkCloudBackupDatabaseType") {
+	mustRunAfter decryptCloudBackupDatabase
+
+	doFirst {
+		file("dumps").listFiles().findAll {
+			return it.name.endsWith(".sql") || it.name.endsWith(".sql.gz")
+		}.each {
+			Pattern projectPattern = ~"lxc([a-z0-9]{4})"
+			Matcher projectMatcher = projectPattern.matcher(it.name)
+
+			if (!projectMatcher.find()) {
+				return
+			}
+
+			String project = projectMatcher.group(1)
+
+			Pattern environmentPattern = ~"-(${project}[a-z0-9]+)"
+			Matcher environmentMatcher = environmentPattern.matcher(it.name)
+
+			if (!environmentMatcher.find()) {
+				return
+			}
+
+			String environment = environmentMatcher.group(1)
+
+			if (!environment.startsWith(project)) {
+				return
+			}
+
+			config.databasePartitioningEnabled = true
+
+			updateGradleLocalProperties([
+				"lr.docker.environment.database.partitioning.enabled": "true",
+			])
+
+			JsonSlurper jsonSlurper = new JsonSlurper()
+			Object lcpDescriptor = jsonSlurper.parse(new File(file(config.liferayLXCRepositoryPath), "liferay/LCP.json"))
+
+			Map<String, String> environmentEnv = lcpDescriptor["environments"].containsKey(environment) ? lcpDescriptor["environments"][environment]["env"] : [:]
+
+			if ((environmentEnv["LIFERAY_JDBC_PERIOD_DEFAULT_PERIOD_URL"] != null) && environmentEnv["LIFERAY_JDBC_PERIOD_DEFAULT_PERIOD_URL"].contains("postgres")) {
+				if (!config.services.contains("postgres")) {
+					updateGradleLocalProperties([
+						"lr.docker.environment.service.enabled[mysql]": "false",
+						"lr.docker.environment.service.enabled[postgres]": "true",
+					])
+
+					throw new GradleException("Updated gradle-local.properties to enable postgres, please re-run the task")
+				}
+			}
+			else {
+				if (!config.services.contains("mysql")) {
+					updateGradleLocalProperties([
+						"lr.docker.environment.service.enabled[mysql]": "true",
+						"lr.docker.environment.service.enabled[postgres]": "false",
+					])
+
+					throw new GradleException("Updated gradle-local.properties to enable mysql, please re-run the task")
+				}
+			}
+		}
+	}
+}
+
+importDatabaseDumps.mustRunAfter checkCloudBackupDatabaseType
+updateCloudBackupConfigsForLocalDevelopment.mustRunAfter updateCloudBackupDatabaseForLocalDevelopment
+
+tasks.register("importCloudBackupDatabase") {
+	dependsOn decryptCloudBackupDatabase
+	dependsOn checkCloudBackupDatabaseType
+	dependsOn importDatabaseDumps
+	dependsOn updateCloudBackupDatabaseForLocalDevelopment
+	dependsOn updateCloudBackupConfigsForLocalDevelopment
+}
+
+tasks.register("importCloudBackupDocumentLibrary") {
+	dependsOn decryptCloudBackupDocumentLibrary
+	dependsOn dockerCreate
+
+	onlyIf {
+		config.useLiferay
+	}
+
+	doFirst {
+		restoreVolume("${config.namespace.toLowerCase()}_liferay-data-volume", file("liferay_data"), config.documentLibraryFileListOnly)
+	}
+}
+
+tasks.register("importCloudBackup") {
+	dependsOn importCloudBackupDatabase
+	dependsOn importCloudBackupDocumentLibrary
+}
