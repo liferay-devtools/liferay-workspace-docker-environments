@@ -2,7 +2,9 @@ services:
     liferay:
         container_name: ${NAMESPACE}-liferay
         environment:
+            - JPDA_SUSPEND=n
             - LIFERAY_JPDA_ENABLED=true
+            - LIFERAY_DISABLE_TRIAL_LICENSE=true
         healthcheck:
             interval: 5s
             start_period: 5m
@@ -14,8 +16,8 @@ services:
             - "11311:11311"
             - "8000:8000"
         volumes:
-            - source: data-volume
+            - source: liferay-data-volume
               target: /opt/liferay/data
               type: volume
-              volume:
-                  subpath: container-data/liferay
+volumes:
+    liferay-data-volume:
