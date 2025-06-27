@@ -69,6 +69,12 @@ class Config {
 		}
 
 		this.liferayDockerImageId = "${this.namespace.toLowerCase()}-liferay"
+
+		def webserverHostnames = project.getProperty("lr.docker.environment.web.server.hostnames").split(',')*.trim().findAll { it }
+
+		if(webserverHostnames != null) {
+			this.webserverHostnames = webserverHostnames.join(' ')
+		}
 	}
 
 	static List toList(String s) {
@@ -84,6 +90,7 @@ class Config {
 	public String liferayDockerImageId = ""
 	public String namespace = "lrswde"
 	public List<String> services = new ArrayList<String>()
+	public String webserverHostnames = "my.example.com"
 
 	@Override
 	public String toString() {
@@ -101,6 +108,7 @@ hotfixURLs: ${hotfixURLs}
 liferayDockerImageId: ${liferayDockerImageId}
 namespace: ${namespace}
 services: ${services}
+webserverHostnames: ${webserverHostnames}
 
 """
 	}
@@ -115,6 +123,8 @@ gradle.liferayWorkspace {
 boolean useLiferay = config.services.contains("liferay")
 
 boolean useClustering = useLiferay && config.clusterNodes > 0
+
+boolean useWebserver = config.services.contains("webserver")
 
 ConfigurableFileTree dockerComposeFileTree = project.fileTree(projectDir) {
 	include "**/service.*.yaml"
@@ -179,6 +189,21 @@ tasks.register("exportContainerData", DockerCopyFileFromContainer) {
 	remotePath = "/data/container-data"
 }
 
+tasks.register("configureWebserver", Copy) {
+	outputs.upToDateWhen { false }
+
+	String clusterHttpUpstreamConfig = useClustering ? "server liferay-cluster-node:8080;" : ""
+
+	from 'templates/webserver/config'
+
+	include 'default.conf.template'
+	rename 'default.conf.template', 'default.conf'
+
+	expand (webserverHostnames: config.webserverHostnames, clusterHttpUpstreamConfig: clusterHttpUpstreamConfig)
+
+	into 'compose-recipes/webserver/build/config'
+}
+
 tasks.register("prepareHotfixes", Download) {
 	dest project.layout.dir(project.provider {project.file("configs/common/patching")})
 
@@ -234,11 +259,16 @@ tasks.register("stop") {
 
 clean {
 	dependsOn ":cleanPrepareHotfixes"
+	dependsOn ":cleanConfigureWebserver"
 }
 
 dockerDeploy {
 	if (useLiferay) {
 		dependsOn ":prepareHotfixes"
+	}
+
+	if (useWebserver) {
+		dependsOn ":configureWebserver"
 	}
 }
 

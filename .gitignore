@@ -18,6 +18,7 @@
 .gradle
 .idea
 /bundles
+/compose-recipes/webserver/build
 /containerLogs
 /data/*
 /dumps/*
