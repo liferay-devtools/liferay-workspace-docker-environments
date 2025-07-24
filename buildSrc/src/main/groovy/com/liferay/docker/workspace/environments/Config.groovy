@@ -83,6 +83,18 @@ class Config {
 			this.webserverHostnames = webserverHostnames.join(' ')
 		}
 
+		String yourKitEnabled = project.getProperty("lr.docker.environment.yourkit.enabled")
+
+		if (yourKitEnabled != null) {
+			this.yourKitEnabled = yourKitEnabled.toBoolean()
+		}
+
+		String yourKitUrl = project.getProperty("lr.docker.environment.yourkit.url")
+
+		if (yourKitUrl != null) {
+			this.yourKitUrl = yourKitUrl
+		}
+
 		this.useLiferay = this.services.contains("liferay")
 
 		this.useClustering = this.useLiferay && this.clusterNodes > 0
@@ -125,6 +137,14 @@ class Config {
 				}
 
 				include "**/database-partitioning.*.yaml"
+			}
+
+			if (this.yourKitEnabled) {
+				include "**/yourkit.liferay.yaml"
+
+				if (useClustering) {
+					include "**/yourkit-clustering.liferay.yaml"
+				}
 			}
 		}
 
@@ -180,6 +200,8 @@ class Config {
 	public boolean useWebserverHttp = false
 	public boolean useWebserverHttps = false
 	public String webserverHostnames = "localhost"
+	public boolean yourKitEnabled = "false"
+	public String yourKitUrl = "https://www.yourkit.com/download/docker/YourKit-JavaProfiler-2025.3-docker.zip"
 
 	@Override
 	public String toString() {
