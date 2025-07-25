@@ -24,6 +24,12 @@ class Config {
 
 		this.composeFiles.addAll(this.toList(project.getProperty("lr.docker.environment.compose.files")))
 
+		String clearVolumeData = project.getProperty("lr.docker.environment.clear.volume.data")
+
+		if (clearVolumeData != null) {
+			this.clearVolumeData = clearVolumeData.toBoolean()
+		}
+
 		String databaseName = project.getProperty("lr.docker.environment.database.name")
 
 		if (databaseName != null) {
@@ -48,10 +54,13 @@ class Config {
 			this.hotfixURLs = hotfixURLs
 		}
 
-		String namespace = project.getProperty("lr.docker.environment.namespace")
+		String namespace = project.findProperty("lr.docker.environment.namespace")
 
 		if (namespace != null) {
 			this.namespace = namespace
+		}
+		else {
+			this.namespace = this.project.name
 		}
 
 		List services = project.properties.findAll {
@@ -160,6 +169,7 @@ class Config {
 
 	public Project project
 
+	public boolean clearVolumeData = false
 	public int clusterNodes = 0
 	public List<String> composeFiles = new ArrayList<String>()
 	public String databaseName = "lportal"
@@ -169,7 +179,7 @@ class Config {
 	public boolean dockerImageLiferayDXP = false
 	public List<String> hotfixURLs = new ArrayList<String>()
 	public String liferayDockerImageId = ""
-	public String namespace = "lrswde"
+	public String namespace = null
 	public String product = null
 	public List<String> services = new ArrayList<String>()
 	public boolean useClustering = false
