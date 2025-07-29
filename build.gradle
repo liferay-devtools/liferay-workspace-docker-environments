@@ -92,9 +92,12 @@ buildDockerImage {
 	onlyIf("using the Liferay service") {
 		config.useLiferay
 	}
+
+	dependsOn ":prepareDB2JDBCDriver"
 }
 
 clean {
+	dependsOn ":cleanPrepareDB2JDBCDriver"
 	dependsOn ":cleanPrepareHotfixes"
 	dependsOn ":cleanPrepareSelfSignedCert"
 	dependsOn ":cleanPrepareWebserverConfig"
@@ -103,6 +106,7 @@ clean {
 }
 
 dockerDeploy {
+	dependsOn ":prepareDB2JDBCDriver"
 	dependsOn ":prepareHotfixes"
 	dependsOn ":prepareYourKitAgent"
 }
