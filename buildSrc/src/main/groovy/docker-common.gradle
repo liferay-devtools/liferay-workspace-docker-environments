@@ -47,6 +47,22 @@ ext {
 			}
 		}
 
+		if (config.useDatabaseDB2) {
+			List<String> results = waitForCommand("${getDatabaseAccessCommand(schema)} ${sql}\\\"\"").split("\n").minus("")
+
+			results.removeLast()
+
+			String[] columnHeaders = results[0].trim().split(/[ ]+/)
+
+			String[] values = results[results.size()-1].trim().split(/[ ]+/)
+
+			Map<String, String> result = [columnHeaders, values].transpose().collectEntries {
+				[it[0], it[1]]
+			}
+
+			return [result]
+		}
+
 		throw new GradleException("Unrecognized database type")
 	}
 
@@ -76,12 +92,22 @@ ext {
 
 			return "docker compose exec -e PGPASSWORD=password -e PGOPTIONS=\"--search_path=${schema}\" -it database psql --username=liferay --dbname=${config.databaseName}"
 		}
+
+		if (config.useDatabaseDB2) {
+			if (schema == null) {
+				schema = config.databaseName
+			}
+
+			return "docker compose exec --user db2admin database bash -c \"/opt/ibm/db2/V11.5/bin/db2 connect to ${schema} > /dev/null; /opt/ibm/db2/V11.5/bin/db2 \\\""
+		}
 	}
 
 	getDefaultVirtualHost = {
 		List<Map<String, String>> companyVirtualHosts ->
 
 		Map<String, String> defaultCompanyVirtualHost = null
+
+		String webIdKey = maybeConvertDatabaseTableNameToUpperCase("webId")
 
 		file("configs/common/portal-ext.properties").eachLine {
 			String line = it.trim()
@@ -90,14 +116,14 @@ ext {
 				String webId = line.split("=")[1]
 
 				defaultCompanyVirtualHost = companyVirtualHosts.find {
-					it["webId"] == webId
+					it[webIdKey] == webId
 				}
 			}
 		}
 
 		if (defaultCompanyVirtualHost == null) {
 			defaultCompanyVirtualHost = companyVirtualHosts.find {
-				it["webId"] == "liferay.com"
+				it[webIdKey] == "liferay.com"
 			}
 		}
 
@@ -105,7 +131,7 @@ ext {
 			throw new GradleException("Unable to auto-detect company.default.web.id, please set it in configs/common/portal-ext.properties")
 		}
 
-		return defaultCompanyVirtualHost["webId"]
+		return defaultCompanyVirtualHost[webIdKey]
 	}
 
 	forEachCompanyId = {
@@ -117,14 +143,28 @@ ext {
 
 		companyVirtualHosts.each {
 			try {
-				String schema = config.databasePartitioningEnabled && it["webId"] != defaultWebId ? "lpartition_${it["companyId"]}" : config.databaseName
+				String companyIdKey = maybeConvertDatabaseTableNameToUpperCase("companyId")
+				String hostnameKey = maybeConvertDatabaseTableNameToUpperCase("hostname")
+				String webIdKey = maybeConvertDatabaseTableNameToUpperCase("webId")
 
-				action(it["companyId"], it["hostname"], it["webId"], schema)
+				String schema = config.databasePartitioningEnabled && it[webIdKey] != defaultWebId ? "lpartition_${it[companyIdKey]}" : config.databaseName
+
+				action(it[companyIdKey], it[hostnameKey], it[webIdKey], schema)
 			}
 			catch (Exception e) {
 				e.printStackTrace()
 			}
 		}
+	}
+
+	maybeConvertDatabaseTableNameToUpperCase = {
+		String key ->
+
+		if (config.useDatabaseDB2) {
+			return key.toUpperCase()
+		}
+
+		return key
 	}
 
 	updateGradleLocalProperties = {
