@@ -217,6 +217,14 @@ Set the `lr.docker.environment.database.partitioning.enabled` property to `true`
 lr.docker.environment.database.partitioning.enabled=true
 ```
 
+#### Reset user passwords
+
+Set the `lr.docker.environment.liferay.user.password` property to the password you wish to type when signing in using existing users in imported databases.
+
+```properties
+lr.docker.environment.liferay.user.password=test
+```
+
 ### Elasticsearch Features
 
 #### Enable standalone Elasticsearch
