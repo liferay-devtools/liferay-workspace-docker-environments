@@ -1,5 +1,7 @@
 package com.liferay.docker.workspace.environments
 
+import java.lang.reflect.Field
+
 import java.util.regex.Pattern
 import java.util.regex.Matcher
 
@@ -42,6 +44,30 @@ class Config {
 			this.databasePartitioningEnabled = databasePartitioningEnabledProperty.toBoolean()
 		}
 
+		String lxcBackupPasswordProperty = project.findProperty("lr.docker.environment.lxc.backup.password")
+
+		if (lxcBackupPasswordProperty != null) {
+			this.lxcBackupPassword = lxcBackupPasswordProperty
+		}
+
+		String lxcEnvironmentNameProperty = project.findProperty("lr.docker.environment.lxc.environment.name")
+
+		if (lxcEnvironmentNameProperty != null) {
+			this.lxcEnvironmentName = lxcEnvironmentNameProperty
+		}
+
+		String lxcRepositoryPathProperty = project.findProperty("lr.docker.environment.lxc.repository.path")
+
+		if (lxcRepositoryPathProperty != null) {
+			this.lxcRepositoryPath = lxcRepositoryPathProperty
+		}
+
+		String liferayUserPasswordProperty = project.findProperty("lr.docker.environment.liferay.user.password")
+
+		if (liferayUserPasswordProperty != null) {
+			this.liferayUserPassword = liferayUserPasswordProperty
+		}
+
 		String dataDirectoryProperty = project.findProperty("lr.docker.environment.data.directory")
 
 		if (dataDirectoryProperty != null && dataDirectory.length() > 0) {
@@ -76,11 +102,17 @@ class Config {
 		}
 
 		List services = project.properties.findAll {
-			it.key =~ /^lr.docker.environment.service.enabled\[\w+\]$/
+			Map.Entry<String, String> property ->
+
+			property.key =~ /^lr.docker.environment.service.enabled\[\w+\]$/
 		}.findAll {
-			it.value =~ /true|1/
+			Map.Entry<String, String> serviceProperty ->
+
+			serviceProperty.value =~ /true|1/
 		}.collect {
-			it.key.substring(it.key.indexOf("[") + 1, it.key.indexOf("]"))
+			Map.Entry<String, String> serviceProperty ->
+
+			serviceProperty.key.substring(serviceProperty.key.indexOf("[") + 1, serviceProperty.key.indexOf("]"))
 		}
 
 		if (!services.isEmpty()) {
@@ -123,6 +155,7 @@ class Config {
 		if (this.services.contains("db2")) {
 			this.useDatabase = true
 			this.useDatabaseDB2 = true
+			this.dockerContainerDatabase = "${this.namespace}-database-db2"
 		}
 
 		if (this.services.contains("mariadb")) {
@@ -133,11 +166,13 @@ class Config {
 		if (this.services.contains("mysql")) {
 			this.useDatabase = true
 			this.useDatabaseMySQL = true
+			this.dockerContainerDatabase = "${this.namespace}-database-mysql"
 		}
 
 		if (this.services.contains("postgres")) {
 			this.useDatabase = true
 			this.useDatabasePostgreSQL = true
+			this.dockerContainerDatabase = "${this.namespace}-database-postgres"
 		}
 
 		if (this.services.contains("webserver_http") && this.services.contains("webserver_https")) {
@@ -188,9 +223,13 @@ class Config {
 
 			if (matchingFileTree.isEmpty()) {
 				List<String> possibleServices = dockerComposeFileTree.findAll{
-					it.name.startsWith("service.")
+					File composeFile ->
+
+					composeFile.name.startsWith("service.")
 				}.collect {
-					it.name.substring("service.".length(), it.name.indexOf(".yaml"))
+					File serviceComposeFile ->
+
+					serviceComposeFile.name.substring("service.".length(), serviceComposeFile.name.indexOf(".yaml"))
 				}
 
 				throw new GradleException(
@@ -199,7 +238,9 @@ class Config {
 
 			matchingFileTree.getFiles()
 		}.flatten().collect {
-			projectDir.relativePath(it)
+			File serviceComposeFile ->
+
+			projectDir.relativePath(serviceComposeFile)
 		}
 
 		this.composeFiles.addAll(serviceComposeFiles)
@@ -217,16 +258,23 @@ class Config {
 
 	public boolean clearVolumeData = false
 	public int clusterNodes = 0
+	public List<Map<String, String>> companyVirtualHosts = null
 	public List<String> composeFiles = new ArrayList<String>()
 	public String databaseName = "lportal"
 	public boolean databasePartitioningEnabled = false
 	public String dataDirectory = "data"
+	public Map<String, String> defaultCompanyVirtualHost = null
+	public String dockerContainerDatabase = null
 	public String dockerImageLiferay = null
 	public boolean dockerImageLiferayDXP = false
 	public boolean glowrootEnabled = false
 	public List<String> hotfixURLs = new ArrayList<String>()
 	public boolean isARM = false
 	public String liferayDockerImageId = ""
+	public String liferayUserPassword = "test"
+	public String lxcBackupPassword = null
+	public String lxcEnvironmentName = null
+	public String lxcRepositoryPath = null
 	public String namespace = null
 	public String product = null
 	public List<String> services = new ArrayList<String>()
@@ -245,6 +293,6 @@ class Config {
 
 	@Override
 	public String toString() {
-		return "${this.class.declaredFields.findAll{ !it.synthetic && !it.name.toLowerCase().contains("password") }*.name.collect { "${it}: ${this[it]}" }.join("\n")}"
+		return "${this.class.declaredFields.findAll{ Field field -> !field.synthetic && !field.name.toLowerCase().contains("password") }*.name.collect { String fieldName -> "${fieldName}: ${this[fieldName]}" }.join("\n")}"
 	}
 }

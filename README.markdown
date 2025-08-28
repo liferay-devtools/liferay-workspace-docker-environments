@@ -193,11 +193,28 @@ lr.docker.environment.service.enabled[postgres]=true
 
 #### Import a database dump
 
-Database dump files can be added to the `./dumps` directory at the root of the Workspace. It will automatically be copied into the MySQL container.
+Database dump files can be added to the `./dumps` directory at the root of the Workspace. They will automatically be copied into the database container.
 
 ```
-./dumps/dumpfile.sql
+./dumps/dumpfile.sql  # raw database dump file
+./dumps/dumpfile.gz   # compressed database dump file downloaded from LXC or extracted from a password-protected archive
 ```
+
+For SaaS database backups, you will often be provided with a password-protected 7zip file. While ideally you would extract the file, the tool can also automatically extract it for you if you set the `lr.docker.environment.lxc.backup.password` property in `gradle.properties` to the provided password.
+
+```
+./dumps/dumpfile.7z   # database dump file provided by SRE team (SaaS), usually password-protected
+./dumps/dumpfile.zip  # database dump file provided by SRE team (SaaS), usually password-protected
+```
+
+When importing SaaS database backups, make sure to set properties to allow the tool to find information related to the SaaS environment.
+
+```
+lr.docker.environment.lxc.environment.name=abc1prd
+lr.docker.environment.lxc.repository.path=/home/me/dev/projects/liferay-lxc
+```
+
+For example, if the projectId is `lxcabc1-abc1prd`, the environment name name is `abc1prd`. The tool will use this information to automatically copy configurations from the `liferay/liferay-lxc` repository, the same way Spinner does.
 
 #### Enable database partitioning (MySQL and PostgreSQL only)
 
@@ -207,6 +224,14 @@ Set the `lr.docker.environment.database.partitioning.enabled` property to `true`
 
 ```properties
 lr.docker.environment.database.partitioning.enabled=true
+```
+
+#### Reset user passwords
+
+Set the `lr.docker.environment.liferay.user.password` property to the password you wish to type when signing in using existing users in imported databases.
+
+```properties
+lr.docker.environment.liferay.user.password=test
 ```
 
 ### Elasticsearch Features
